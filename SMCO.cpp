@@ -30,7 +30,7 @@ struct SMCOParams {
     int n_starts = 100;
 
     // Iteration control
-    int iter_max = 200;
+    int iter_max = 100;
     int iter_nstart = 1;        // n_0 in the paper
     int iter_boost = 0;         // k in the paper (virtual iteration offset)
 
@@ -39,7 +39,7 @@ struct SMCOParams {
     bool buffer_rand = false;    // If true, multiplies buffer by random U(-1,1)
 
     // Convergence & Logic
-    double tol_conv = 1e-8;
+    double tol_conv = 1e-6;
     bool refine_search = true;
     double refine_ratio = 0.5;   // Split iter_max between initial and refine stages
     bool use_runmax = true;      // Keep track of best point seen during gradient steps
@@ -393,16 +393,16 @@ int main() {
 
     // Setup Rastrigin Problem (50 Dimensions)
     // R Default: n_starts = 100, iter_max = 200
-    int dim = 50;
+    int dim = 2;
     std::cout << "=== SMCO (Deterministic Strategic Arms) on " << dim << "D Rastrigin ===" << std::endl;
 
     Eigen::VectorXd lb = Eigen::VectorXd::Constant(dim, -5.12);
     Eigen::VectorXd ub = Eigen::VectorXd::Constant(dim, 5.12);
 
-    params.n_starts = 50;      // Reduced for quick demo
-    params.iter_max = 200;
+    params.n_starts = 1;      // Reduced for quick demo
+    params.iter_max = 500;
     params.minimize = true;    // Rastrigin is minimization
-    params.random_seed = 999;
+    params.random_seed = 24;
 
     // R defaults:
     params.bounds_buffer = 0.05;
@@ -418,7 +418,7 @@ int main() {
     std::cout << "Best Value: " << res.optimal_value << " (Target: 0.0)" << std::endl;
     std::cout << "Total Iterations (Across all starts): " << res.iterations_performed << std::endl;
     std::cout << "Time: " << elapsed.count() << "s" << std::endl;
-    std::cout << "First 5 X: " << res.optimal_x.head(5).transpose() << std::endl;
+   // std::cout << "First 5 X: " << res.optimal_x.head(5).transpose() << std::endl;
 
     return 0;
 }
