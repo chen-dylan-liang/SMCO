@@ -1,34 +1,61 @@
 /**
- * Strategic Monte Carlo Optimization (SMCO) - Eigen Optimized Version
- * * Description:
- * A high-performance implementation of SMCO using the Eigen linear algebra library.
- * This version leverages SIMD vectorization for faster vector updates, making it
- * suitable for high-dimensional optimization problems.
- *
- * Dependencies: 
- * - Eigen 3 (http://eigen.tuxfamily.org/)
- * * Compile command example:
- * g++ -I /usr/local/include/eigen3 smco_eigen.cpp -o smco_opt -O3
+ * Strategic Monte Carlo Optimization (SMCO)
+ * C++ Implementation (Eigen Optimized)
+ * * Based on the R implementation:
+ * https://github.com/wayne-y-gao/SMCO/blob/main/SMCO.R
+ * * LOGIC SUMMARY:
+ * 1. Optimization via Strategic Law of Large Numbers.
+ * 2. Strategic Draw 'Z': Deterministic selection of extended bounds based on gradient sign.
+ * - If Grad > 0: Z = Upper_Bound + Buffer
+ * - If Grad < 0: Z = Lower_Bound - Buffer
+ * 3. Hierarchy: Single -> Refine (Two-stage) -> Boost (iterative).
+ * * Dependencies: Eigen 3
  */
 
 #include <iostream>
-#include <vector>
 #include <cmath>
-#include <functional>
 #include <random>
+#include <algorithm>
 #include <iomanip>
-#include <Eigen/Dense> // Requires Eigen library
+#include <chrono>
+#include <limits>
+#include <Eigen/Dense>
 
 // ============================================================================
-// Configuration
+// Configuration Structures
 // ============================================================================
 
 struct SMCOParams {
-    int max_iterations = 10000;
-    double tolerance = 1e-6;
-    double step_size_grad = 1e-5;
-    bool minimize = false;
-    int random_seed = 42;
+    // Multi-start parameters
+    int n_starts = 100;
+
+    // Iteration control
+    int iter_max = 200;
+    int iter_nstart = 1;        // n_0 in the paper
+    int iter_boost = 0;         // k in the paper (virtual iteration offset)
+
+    // Bounds & Buffers
+    double bounds_buffer = 0.05; // 5% expansion of bounds for Z
+    bool buffer_rand = false;    // If true, multiplies buffer by random U(-1,1)
+
+    // Convergence & Logic
+    double tol_conv = 1e-8;
+    bool refine_search = true;
+    double refine_ratio = 0.5;   // Split iter_max between initial and refine stages
+    bool use_runmax = true;      // Keep track of best point seen during gradient steps
+    bool minimize = false;       // Internal logic is Maximization. Set true to minimize f(x).
+
+    int random_seed = 123;
+};
+
+struct SingleResult {
+    Eigen::VectorXd x_optimal; // The "Strategic Mean" X_n
+    double f_optimal;
+
+    Eigen::VectorXd x_runmax;  // The greedy best point seen
+    double f_runmax;
+
+    int iterations;
 };
 
 struct SMCOResult {
@@ -39,12 +66,20 @@ struct SMCOResult {
 };
 
 // ============================================================================
-// SMCO Optimizer Class (Eigen Version)
+// SMCO Optimizer Class
 // ============================================================================
 
 class SMCOptimizer {
 private:
     std::mt19937 rng;
+
+    // Helper: Check bounds and clamp if necessary
+    // Returns clamped vector
+    Eigen::VectorXd check_bounds(const Eigen::VectorXd& x,
+                                 const Eigen::VectorXd& lb,
+                                 const Eigen::VectorXd& ub) {
+        return x.cwiseMax(lb).cwiseMin(ub);
+    }
 
 public:
     SMCOptimizer() {
@@ -52,114 +87,302 @@ public:
         rng.seed(rd());
     }
 
-    SMCOResult solve(
-        std::function<double(const Eigen::VectorXd&)> func,
-        const Eigen::VectorXd& lower_bounds,
-        const Eigen::VectorXd& upper_bounds,
-        SMCOParams params = SMCOParams()
+    // ------------------------------------------------------------------------
+    // Core Routine: SMCO_single
+    // Corresponds to R function: SMCO_single
+    // ------------------------------------------------------------------------
+    SingleResult solve_single(
+            const std::function<double(const Eigen::VectorXd&)>& f,
+            const Eigen::VectorXd& lb,
+            const Eigen::VectorXd& ub,
+            const Eigen::VectorXd& start_point,
+            double current_bounds_buffer,
+            const SMCOParams& params,
+            int current_iter_max,
+            int current_iter_boost
     ) {
-        // 1. Validation
-        long dim = lower_bounds.size();
-        if (upper_bounds.size() != dim) {
-            throw std::invalid_argument("Bounds dimension mismatch.");
-        }
+        int d = lb.size();
+        Eigen::VectorXd bounds_diff = ub - lb;
 
-        rng.seed(params.random_seed);
+        // Initialize State
+        Eigen::VectorXd x_current = start_point;
+        double f_current = f(x_current);
 
-        // Wrapper to handle Minimization vs Maximization internally
-        auto objective = [&](const Eigen::VectorXd& x) {
-            return params.minimize ? -func(x) : func(x);
-        };
+        // Running Max (Greedy tracking)
+        Eigen::VectorXd x_runmax = x_current;
+        double f_runmax = f_current;
 
-        // 2. Initialization
-        // Initialize x randomly within bounds
-        Eigen::VectorXd current_x(dim);
-        for (int i = 0; i < dim; ++i) {
-            std::uniform_real_distribution<double> dist(lower_bounds[i], upper_bounds[i]);
-            current_x[i] = dist(rng);
-        }
+        // Counters
+        int n_start = current_iter_boost + params.iter_nstart;
+        int n_end = n_start + current_iter_max;
 
-        // S_0 = x_0
-        Eigen::VectorXd S = current_x;
-        double current_val = objective(current_x);
-        bool converged = false;
-        int n = 0;
+        // Initial Sum S_n = x_start * n
+        // Note: R code does S = start_point * n_boost_1
+        Eigen::VectorXd S = start_point * (double)n_start;
 
-        // Pre-allocate vector Z to avoid re-allocation inside loop
-        Eigen::VectorXd Z(dim);
+        // Main Loop
+        int n = n_start;
+        for (; n < n_end; ++n) {
 
-        // 3. Main Loop
-        for (n = 0; n < params.max_iterations; ++n) {
-            
-            // A. Compute Gradient (Finite Difference)
-            // Note: We still need a loop here because we perturb one dimension at a time.
-            // However, the vector addition inside is now optimized by Eigen.
-            Eigen::VectorXd grad(dim);
-            for (int j = 0; j < dim; ++j) {
-                double original_xj = current_x[j];
-                
-                // Perturb x_j
-                current_x[j] += params.step_size_grad;
-                double f_plus = objective(current_x);
-                
-                // Restore x_j
-                current_x[j] = original_xj;
+            // 1. Compute Adaptive Step Size h
+            // R: h_step <- bounds_diff / (n + 1)
+            Eigen::VectorXd h_step = bounds_diff / (double)(n + 1);
 
-                grad[j] = (f_plus - current_val) / params.step_size_grad;
-            }
+            // 2. Compute Partial Gradient Signs (Finite Difference)
+            // R: compute_partial_signs(..., partial_option="center")
+            // We implement "center" (two-sided) strategy here as it's robust.
 
-            // B. Strategic Sampling (The "Two-Armed" Bandit)
-            // This part is inherently conditional per dimension, so we loop.
-            // Ideally, we could use Eigen::select, but random generation usually requires sequential calls.
-            for (int j = 0; j < dim; ++j) {
-                double L = lower_bounds[j];
-                double U = upper_bounds[j];
-                double Mid = (L + U) * 0.5;
+            Eigen::VectorXi signs(d); // 1 for Positive, 0 for Negative
 
-                if (grad[j] >= 0) {
-                    // Positive gradient -> Sample upper half
-                    std::uniform_real_distribution<double> dist(Mid, U);
-                    Z[j] = dist(rng);
-                } else {
-                    // Negative gradient -> Sample lower half
-                    std::uniform_real_distribution<double> dist(L, Mid);
-                    Z[j] = dist(rng);
+            Eigen::VectorXd x_plus = x_current;
+            Eigen::VectorXd x_minus = x_current;
+
+            for (int j = 0; j < d; ++j) {
+                // Constrained perturbation
+                double h = h_step[j];
+                double val_plus = std::min(x_current[j] + h, ub[j]);
+                double val_minus = std::max(x_current[j] - h, lb[j]);
+
+                double original_val = x_current[j];
+
+                // Eval f(x+)
+                x_current[j] = val_plus;
+                double f_plus = f(x_current);
+
+                // Eval f(x-)
+                x_current[j] = val_minus;
+                double f_minus = f(x_current);
+
+                // Reset
+                x_current[j] = original_val;
+
+                // Determine Sign
+                bool sign_positive = (f_plus > f_minus);
+                signs[j] = sign_positive ? 1 : 0;
+
+                // Update Greedy Runmax
+                if (params.use_runmax) {
+                    if (sign_positive && f_plus > f_runmax) {
+                        f_runmax = f_plus;
+                        x_runmax = x_current; // Base vector
+                        x_runmax[j] = val_plus;
+                    } else if (!sign_positive && f_minus > f_runmax) {
+                        f_runmax = f_minus;
+                        x_runmax = x_current; // Base vector
+                        x_runmax[j] = val_minus;
+                    }
                 }
             }
 
-            // C. Update Step (Eigen Optimization shines here)
-            // Vectorized Addition
+            // 3. Calculate Strategic Draw 'Z'
+            // R: Z <- signs * bounds_upper_out + (1-signs) * bounds_lower_out
+            // Logic: If ascent (sign=1), pull towards Upper Bound. Else Lower Bound.
+
+            // Calculate Expanded Bounds
+            Eigen::VectorXd bound_out_amt = bounds_diff * current_bounds_buffer;
+
+            if (params.buffer_rand) {
+                // If random buffer enabled (R: runif(d, -1, 1))
+                std::uniform_real_distribution<double> dist(-1.0, 1.0);
+                for(int k=0; k<d; ++k) bound_out_amt[k] *= dist(rng);
+            }
+
+            Eigen::VectorXd ub_out = ub + bound_out_amt;
+            Eigen::VectorXd lb_out = lb - bound_out_amt;
+
+            Eigen::VectorXd Z(d);
+            for (int j = 0; j < d; ++j) {
+                Z[j] = (signs[j] == 1) ? ub_out[j] : lb_out[j];
+            }
+
+            // 4. Update Sum and Average
+            // S_{n+1} = S_n + Z
+            // X_{n+1} = S_{n+1} / (n+1)
             S += Z;
+            Eigen::VectorXd x_next = S / (double)(n + 1);
+            double f_next = f(x_next);
 
-            // Vectorized Scalar Division
-            // x_{n+1} = S_{n+1} / (n + 2)
-            Eigen::VectorXd next_x = S / (n + 2.0);
+            // Update Runmax with the new average
+            if (params.use_runmax && f_next > f_runmax) {
+                f_runmax = f_next;
+                x_runmax = x_next;
+            }
 
-            // D. Check Convergence
-            double next_val = objective(next_x);
-            
-            if (std::abs(next_val - current_val) <= params.tolerance) {
-                current_x = next_x;
-                current_val = next_val;
-                converged = true;
+            // 5. Convergence Check
+            // R: checks convergence after 50% of iterations
+            double diff = std::abs(f_next - f_current);
+            if (n >= (n_start + current_iter_max/2) && diff < params.tol_conv) {
+                x_current = x_next;
+                f_current = f_next;
                 break;
             }
 
-            current_x = next_x;
-            current_val = next_val;
+            x_current = x_next;
+            f_current = f_next;
         }
 
-        return {current_x, (params.minimize ? -current_val : current_val), n, converged};
+        return {x_current, f_current, x_runmax, f_runmax, n - current_iter_boost};
+    }
+
+    // ------------------------------------------------------------------------
+    // Refinement Wrapper: SMCO_single_refine
+    // ------------------------------------------------------------------------
+    SingleResult solve_refine(
+            const std::function<double(const Eigen::VectorXd&)>& f,
+            const Eigen::VectorXd& lb,
+            const Eigen::VectorXd& ub,
+            const Eigen::VectorXd& start_point,
+            double bounds_buffer,
+            const SMCOParams& params,
+            int iter_max,
+            int iter_boost
+    ) {
+        // 1. Initial Search
+        // If refining, split iterations. Else use full.
+        int iter_initial = params.refine_search ?
+                           std::round(iter_max * (1.0 - params.refine_ratio)) :
+                           iter_max;
+
+        SingleResult res = solve_single(f, lb, ub, start_point, bounds_buffer,
+                                        params, iter_initial, iter_boost);
+
+        // Clamp results to valid bounds
+        res.x_optimal = check_bounds(res.x_optimal, lb, ub);
+        res.f_optimal = f(res.x_optimal);
+        if (params.use_runmax) {
+            res.x_runmax = check_bounds(res.x_runmax, lb, ub);
+            res.f_runmax = f(res.x_runmax);
+        }
+
+        // 2. Refined Search (Optional)
+        if (params.refine_search) {
+            int iter_refine = std::round(iter_max * params.refine_ratio);
+
+            // Pick best point to start refinement
+            Eigen::VectorXd start_refine = res.x_optimal;
+            if (params.use_runmax && res.f_runmax > res.f_optimal) {
+                start_refine = res.x_runmax;
+            }
+
+            // R: iter_boost_refine = iter_boost + 1000
+            // R: bounds_buffer = 0 (Tighten bounds for refinement)
+            int boost_refine = iter_boost + 1000;
+
+            SingleResult res_refine = solve_single(f, lb, ub, start_refine,
+                                                   0.0, // Zero buffer
+                                                   params, iter_refine, boost_refine);
+
+            // Merge Refined Results
+            if (params.use_runmax) {
+                // Check if refined runmax is better
+                Eigen::VectorXd r_rm_in = check_bounds(res_refine.x_runmax, lb, ub);
+                double f_r_rm_in = f(r_rm_in);
+
+                if (f_r_rm_in > res_refine.f_optimal) {
+                    res_refine.f_optimal = f_r_rm_in;
+                    res_refine.x_optimal = r_rm_in;
+                }
+            }
+            return res_refine;
+        }
+
+        // If no refinement, just return cleaned result
+        // Logic to swap optimal with runmax if runmax is better
+        if (params.use_runmax && res.f_runmax > res.f_optimal) {
+            res.f_optimal = res.f_runmax;
+            res.x_optimal = res.x_runmax;
+        }
+
+        return res;
+    }
+
+    // ------------------------------------------------------------------------
+    // Boost Wrapper: SMCO_single_boost
+    // ------------------------------------------------------------------------
+    SingleResult solve_boost(
+            const std::function<double(const Eigen::VectorXd&)>& f,
+            const Eigen::VectorXd& lb,
+            const Eigen::VectorXd& ub,
+            const Eigen::VectorXd& start_point,
+            const SMCOParams& params
+    ) {
+        // 1. Run regular search (Boost = 0)
+        SingleResult res = solve_refine(f, lb, ub, start_point, params.bounds_buffer,
+                                        params, params.iter_max, 0);
+
+        // 2. Run additional boosted search if configured
+        if (params.iter_boost > 0) {
+            SingleResult res_boost = solve_refine(f, lb, ub, start_point, params.bounds_buffer,
+                                                  params, params.iter_max, params.iter_boost);
+
+            if (res_boost.f_optimal > res.f_optimal) {
+                res = res_boost;
+            }
+        }
+        return res;
+    }
+
+    // ------------------------------------------------------------------------
+    // Public Entry Point: solve (Multi-Start)
+    // ------------------------------------------------------------------------
+    SMCOResult solve(
+            std::function<double(const Eigen::VectorXd&)> user_func,
+            const Eigen::VectorXd& lb,
+            const Eigen::VectorXd& ub,
+            SMCOParams params = SMCOParams()
+    ) {
+        // Handle Minimization Wrapper
+        auto objective = [&](const Eigen::VectorXd& x) {
+            return params.minimize ? -user_func(x) : user_func(x);
+        };
+
+        rng.seed(params.random_seed);
+        int d = lb.size();
+
+        SingleResult global_best;
+        global_best.f_optimal = -std::numeric_limits<double>::infinity();
+
+        int total_iter = 0;
+
+        // Multi-start Loop
+        // R uses Sobol. We use Uniform Random here for simplicity in a single file,
+        // but iterating this matches the "apply" logic in R.
+        for (int i = 0; i < params.n_starts; ++i) {
+
+            // Generate Start Point (Sobol equivalent placeholder)
+            Eigen::VectorXd start_point(d);
+            for (int j = 0; j < d; ++j) {
+                std::uniform_real_distribution<double> dist(lb[j], ub[j]);
+                start_point[j] = dist(rng);
+            }
+
+            // Execute SMCO Boosted for this point
+            SingleResult res = solve_boost(objective, lb, ub, start_point, params);
+
+            total_iter += res.iterations;
+
+            if (res.f_optimal > global_best.f_optimal) {
+                global_best = res;
+            }
+        }
+
+        // Final cleanup
+        SMCOResult result;
+        result.optimal_x = global_best.x_optimal;
+        // Revert sign if minimizing
+        result.optimal_value = params.minimize ? -global_best.f_optimal : global_best.f_optimal;
+        result.iterations_performed = total_iter;
+        result.converged = true; // Simplified flag
+
+        return result;
     }
 };
 
 // ============================================================================
-// Examples
+// Example Usage
 // ============================================================================
 
 double rastrigin_eigen(const Eigen::VectorXd& x) {
-    // Array-based reduction (fast in Eigen)
-    // formula: 10n + sum(x^2 - 10cos(2pi*x))
     double sum = (x.array().square() - 10 * (2 * M_PI * x.array()).cos()).sum();
     return 10 * x.size() + sum;
 }
@@ -168,33 +391,34 @@ int main() {
     SMCOptimizer optimizer;
     SMCOParams params;
 
-    // Setup Rastrigin Problem (50 Dimensions - where Eigen starts to help)
+    // Setup Rastrigin Problem (50 Dimensions)
+    // R Default: n_starts = 100, iter_max = 200
     int dim = 50;
-    std::cout << "=== Running SMCO with Eigen on " << dim << "D Rastrigin Function ===" << std::endl;
+    std::cout << "=== SMCO (Deterministic Strategic Arms) on " << dim << "D Rastrigin ===" << std::endl;
 
-    // Vectorized bounds setup
     Eigen::VectorXd lb = Eigen::VectorXd::Constant(dim, -5.12);
     Eigen::VectorXd ub = Eigen::VectorXd::Constant(dim, 5.12);
 
-    params.max_iterations = 5000;
-    params.minimize = true;
+    params.n_starts = 50;      // Reduced for quick demo
+    params.iter_max = 200;
+    params.minimize = true;    // Rastrigin is minimization
     params.random_seed = 999;
 
-    // Solve
+    // R defaults:
+    params.bounds_buffer = 0.05;
+    params.refine_search = true;
+    params.use_runmax = true;
+
     auto start = std::chrono::high_resolution_clock::now();
     SMCOResult res = optimizer.solve(rastrigin_eigen, lb, ub, params);
     auto end = std::chrono::high_resolution_clock::now();
 
     std::chrono::duration<double> elapsed = end - start;
 
-    // Output
-    std::cout << "Converged: " << (res.converged ? "Yes" : "No") << std::endl;
-    std::cout << "Iterations: " << res.iterations_performed << std::endl;
-    std::cout << "Optimal Value: " << res.optimal_value << " (Target: 0.0)" << std::endl;
-    std::cout << "Time Elapsed: " << elapsed.count() << "s" << std::endl;
-
-    // Show first 5 coordinates
-    std::cout << "First 5 coords: " << res.optimal_x.head(5).transpose() << std::endl;
+    std::cout << "Best Value: " << res.optimal_value << " (Target: 0.0)" << std::endl;
+    std::cout << "Total Iterations (Across all starts): " << res.iterations_performed << std::endl;
+    std::cout << "Time: " << elapsed.count() << "s" << std::endl;
+    std::cout << "First 5 X: " << res.optimal_x.head(5).transpose() << std::endl;
 
     return 0;
 }
